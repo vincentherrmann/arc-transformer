@@ -1,0 +1,69 @@
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning import Trainer
+from pytorch_lightning.logging import TensorBoardLogger
+import os.path
+import sys
+import argparse
+
+from arc_transformer.arc_system import ArcSystem
+
+
+def get_args():
+    parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser.add_argument('--data-path', metavar='DIR', type=str,
+                               help='path to dataset')
+    parent_parser.add_argument('--save-path', metavar='DIR', default=".", type=str,
+                               help='path to save output')
+    parent_parser.add_argument('--gpus', type=int, default=1,
+                               help='how many gpus')
+    parent_parser.add_argument('--distributed-backend', type=str, default='dp', choices=('dp', 'ddp', 'ddp2'),
+                               help='supports three options dp, ddp, ddp2')
+    parent_parser.add_argument('--use-16bit', dest='use_16bit', action='store_true',
+                               help='if true uses 16 bit precision')
+    parent_parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
+                               help='evaluate model on validation set')
+
+    parser = ArcSystem.add_model_specific_args(parent_parser)
+    return parser.parse_args()
+
+def main(hparams, cluster=None, results_dict=None):
+    """
+    Main training routine specific for this project
+    :param hparams:
+    :return:
+    """
+    # init experiment
+
+    name = "arc_test_1"
+    logs_dir = "/Users/vincentherrmann/Documents/Projekte/abstraction-and-reasoning-challenge/logs"
+    checkpoint_dir = "/Users/vincentherrmann/Documents/Projekte/abstraction-and-reasoning-challenge/checkpoints/" + name
+    hparams.training_set_path = '/Users/vincentherrmann/Documents/Projekte/abstraction-and-reasoning-challenge/data/training'
+    hparams.validation_set_path = '/Users/vincentherrmann/Documents/Projekte/abstraction-and-reasoning-challenge/data/evaluation'
+    hparams.test_task_set_path = '/Users/vincentherrmann/Documents/Projekte/abstraction-and-reasoning-challenge/data/test'
+    hparams.data_path = hparams.training_set_path
+
+    hparams.batch_size = 1
+
+    # build model
+    model = ArcSystem(hparams)
+
+    #logger = TensorBoardLogger(save_dir=logs_dir, name=name)
+    checkpoint_callback = ModelCheckpoint(filepath=checkpoint_dir, save_top_k=1)
+    # configure trainer
+    trainer = Trainer(gpus=0,
+                      train_percent_check=1.,
+                      val_percent_check=1.,
+                      val_check_interval=0.5,
+                      logger=False,
+                      checkpoint_callback=checkpoint_callback,
+                      fast_dev_run=False,
+                      early_stop_callback=False)
+
+    # train model
+    trainer.fit(model)
+
+if __name__ == '__main__':
+    hyperparams = get_args()
+
+    # train model
+    main(hyperparams)
