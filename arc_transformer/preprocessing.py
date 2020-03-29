@@ -51,37 +51,41 @@ class PriorCalculation(torch.nn.Module):
         objects = self.extract_objects(x)
         objects.sort(key=lambda o: o[0].sum(), reverse=True)
         objects = objects[:self.max_num_objects]
-        complete_objects = torch.stack([o[0] for o in objects], dim=2).view(w*h, -1)  # s x o
-        complete_objects_prior = torch.einsum('so,to->st', complete_objects, complete_objects).view(w, h, w, h, 1).float()
+        if len(objects) == 0:
+            complete_objects_prior = torch.zeros_like(color_prior)
+            extracted_objects_prior = torch.zeros(w, h, w, h, self.max_num_objects * 8).to(complete_objects_prior.device)
+        else:
+            complete_objects = torch.stack([o[0] for o in objects], dim=2).view(w*h, -1)  # s x o
+            complete_objects_prior = torch.einsum('so,to->st', complete_objects, complete_objects).view(w, h, w, h, 1).float()
 
-        extracted_objects = []
-        max_size = 0
-        for _, obj in objects:
-            max_size = max(max_size, max(obj.shape))
-            extracted_objects.append(obj)
-            extracted_objects.append(torch.flip(obj, dims=[0]))
-            extracted_objects.append(torch.flip(obj, dims=[1]))
-            extracted_objects.append(torch.flip(obj, dims=[0, 1]))
-            extracted_objects.append(obj.t())
-            extracted_objects.append(torch.flip(obj.t(), dims=[0]))
-            extracted_objects.append(torch.flip(obj.t(), dims=[1]))
-            extracted_objects.append(torch.flip(obj.t(), dims=[0, 1]))
+            extracted_objects = []
+            max_size = 0
+            for _, obj in objects:
+                max_size = max(max_size, max(obj.shape))
+                extracted_objects.append(obj)
+                extracted_objects.append(torch.flip(obj, dims=[0]))
+                extracted_objects.append(torch.flip(obj, dims=[1]))
+                extracted_objects.append(torch.flip(obj, dims=[0, 1]))
+                extracted_objects.append(obj.t())
+                extracted_objects.append(torch.flip(obj.t(), dims=[0]))
+                extracted_objects.append(torch.flip(obj.t(), dims=[1]))
+                extracted_objects.append(torch.flip(obj.t(), dims=[0, 1]))
 
-        object_canvas = torch.zeros(max_size, max_size).long()
-        for i, obj in enumerate(extracted_objects):
-            c = object_canvas.clone()
-            c[:obj.shape[0], :obj.shape[1]] = obj
-            extracted_objects[i] = c
-        extracted_objects = torch.stack(extracted_objects, dim=0)
-        c = torch.zeros(extracted_objects.shape[0], w, h).long()
-        c[:, :w, :h] = extracted_objects[:, :w, :h]
-        skew_c = torch.zeros(c.shape[0], w*h+1).long()
-        skew_c[:, :w*h] = c.view(-1, w*h)
-        skew_c = skew_c[:, None, :].repeat(1, w*h, 1).view(-1, w*h+1, w*h)
-        extracted_objects_prior = skew_c[:, :w*h, :].view(-1, w, h, w, h).permute(1, 2, 3, 4, 0).float()
-        if extracted_objects_prior.shape[4] < self.max_num_objects * 8:
-            extracted_objects_prior = F.pad(extracted_objects_prior,
-                                            pad=(0, self.max_num_objects * 8 - extracted_objects_prior.shape[4]))
+            object_canvas = torch.zeros(max_size, max_size).long()
+            for i, obj in enumerate(extracted_objects):
+                c = object_canvas.clone()
+                c[:obj.shape[0], :obj.shape[1]] = obj
+                extracted_objects[i] = c
+            extracted_objects = torch.stack(extracted_objects, dim=0)
+            c = torch.zeros(extracted_objects.shape[0], w, h).long()
+            c[:, :max_size, :max_size] = extracted_objects[:, :w, :h]
+            skew_c = torch.zeros(c.shape[0], w*h+1).long()
+            skew_c[:, :w*h] = c.view(-1, w*h)
+            skew_c = skew_c[:, None, :].repeat(1, w*h, 1).view(-1, w*h+1, w*h)
+            extracted_objects_prior = skew_c[:, :w*h, :].view(-1, w, h, w, h).permute(1, 2, 3, 4, 0).float()
+            if extracted_objects_prior.shape[4] < self.max_num_objects * 8:
+                extracted_objects_prior = F.pad(extracted_objects_prior,
+                                                pad=(0, self.max_num_objects * 8 - extracted_objects_prior.shape[4]))
 
         all_priors = torch.cat([patterns_prior, color_prior, complete_objects_prior, extracted_objects_prior], dim=4)
         return all_priors.view(w*h, w*h, -1)

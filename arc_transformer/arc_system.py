@@ -4,6 +4,7 @@ import argparse
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
+import torch.nn
 from six import string_types
 from torch import optim
 from torch.utils.data import DataLoader
@@ -28,6 +29,7 @@ class ArcSystem(pl.LightningModule):
         self.setup_datasets()
         self.prior_calc = PriorCalculation()
         self.model = ArcTransformer(feature_dim=128, feedforward_dim=512, num_priors=self.prior_calc.num_priors)
+        self.out_transform = torch.nn.Linear(in_features=128, out_features=11)
 
     def setup_datasets(self):
         self.training_set = ArcDataset(self.hparams.training_set_path)
@@ -35,30 +37,42 @@ class ArcSystem(pl.LightningModule):
         self.validation_set = ArcDataset(self.hparams.validation_set_path)
         print("validation set length:", len(self.validation_set))
 
+    def preprocessing(self, task_data):
+        task_data = task_map(task_data, lambda t: t[0])
+        priors = task_map(task_data, self.prior_calc)
+
+        #task_map(task_data, lambda t: print("grid shape", t.shape))
+        #task_map(priors, lambda t: print("prior shape", t.shape))
+
+        task_data = task_map(task_data, lambda t: t + 1)
+        task_data, max_size = self.make_uniform_size(task_data)
+        priors, _ = self.make_uniform_size(priors, size=[max_size[0] * max_size[1], max_size[0] * max_size[1]])
+
+        #task_map(task_data, lambda t: print("grid u shape", t.shape))
+        #task_map(priors, lambda t: print("prior u shape", t.shape))
+
+        return task_data, priors
 
     # ---------------------
     # TRAINING
     # ---------------------
-    def forward(self, task_data):
+    def forward(self, task_data, priors):
         """
         No special modification required for lightning, define as you normally would
         :param x:
         :return:
         """
-        task_data = task_map(task_data, lambda t: t[0])
-        priors = task_map(task_data, self.prior_calc)
-        task_data = task_map(task_data, lambda t: t + 1)
-        task_data = self.make_uniform_size(task_data)
-        priors = self.make_uniform_size(priors)
-
-        self.model(task_data, priors)
-        return None
+        grids, pair_features, task_features = self.model(task_data, priors)
+        test_out_grid = grids[-1]
+        test_out_grid = self.out_transform(test_out_grid)
+        return test_out_grid
 
     @staticmethod
-    def make_uniform_size(data):
-        size = task_reduce(data,
-                           f=lambda r, t: [max(r[0], t.shape[0]), max(r[1], t.shape[1])],
-                           start_value=[0, 0])
+    def make_uniform_size(data, size=None):
+        if size is None:
+            size = task_reduce(data,
+                               f=lambda r, t: [max(r[0], t.shape[0]), max(r[1], t.shape[1])],
+                               start_value=[0, 0])
         def pad_end(t):
             padding = (0, size[1] - t.shape[1], 0, size[0] - t.shape[0])
             if len(t.shape) == 3:
@@ -67,7 +81,7 @@ class ArcSystem(pl.LightningModule):
             return r
         data = task_map(data,
                         f=pad_end)
-        return data
+        return data, size
 
     def loss(self, scores):
         batch_size = scores.shape[0]
@@ -88,35 +102,24 @@ class ArcSystem(pl.LightningModule):
 
         return loss
 
-    def training_step(self, batch, batch_i):
+    def training_step(self, data, batch_i):
         """
         Lightning calls this inside the training loop
         :param data_batch:
         :return:
         """
+        task_data, priors = self.preprocessing(data)
+        target = task_data["test"][-1]["output"].clone()
+        task_data["test"][-1]["output"] = torch.ones_like(target)
 
-        batch = batch[0]
-
-        self.eval()
-
-        # forward pass
-        predicted_z, targets, _, _, scal = self.forward(batch)
-        scores = torch.tensordot(predicted_z, targets, dims=([2], [1]))  # data_batch, data_step, target_batch, target_step
-        loss = self.loss(scores)
-
-        if self.hparams.wasserstein_penalty != 0.:
-            score_sum = torch.sum(scores)
-            scal_grad = torch.autograd.grad(outputs=score_sum,
-                                             inputs=scal,
-                                             create_graph=True,
-                                             retain_graph=True,
-                                             only_inputs=True)
-            gradient_penalty = ((scal_grad[0].norm(2, dim=1) - 1) ** 2).mean()
-            loss += self.hparams.wasserstein_penalty * gradient_penalty
+        test_grid_out = self.forward(task_data, priors)
+        loss = F.cross_entropy(test_grid_out.view(-1, 11), target.view(-1))
 
         # in DP mode (default) make sure if result is scalar, there's another dim in the beginning
         if self.trainer.use_dp:
             loss = loss.unsqueeze(0)
+
+        print("loss:", loss.item())
 
         output = OrderedDict({
             'loss': loss,
@@ -144,48 +147,23 @@ class ArcSystem(pl.LightningModule):
         """
 
         # forward pass
-        result = self.forward(data)
         # predicted_z: batch, step, features
         # targets: batch, features, step
-        scores = torch.tensordot(predicted_z, targets, dims=([2], [1]))  # data_batch, data_step, target_batch, target_step
-        loss = self.loss(scores)  # valid scores: batch, time_step
 
-        if False: #self.hparams.wasserstein_penalty != 0.:
-            score_sum = torch.sum(scores)
-            score_sum.requires_grad = True
-            scal.requires_grad = True
-            scal_grad = torch.autograd.grad(outputs=score_sum,
-                                             inputs=scal,
-                                             create_graph=True,
-                                             retain_graph=True,
-                                             only_inputs=True,
-                                             allow_unused=True)
-            gradient_penalty = ((scal_grad[0].norm(2, dim=1) - 1) ** 2).mean()
-            loss += self.hparams.wasserstein_penalty * gradient_penalty
+        task_data, priors = self.preprocessing(data)
+        target = task_data["test"][-1]["output"].clone()
+        task_data["test"][-1]["output"] = torch.ones_like(target)
 
-        # calculate prediction accuracy as the proportion of scores that are highest for the correct target
-        prediction_template = torch.arange(0, scores.shape[0], dtype=torch.long)
-        if self.hparams.score_over_all_timesteps:
-            prediction_template = torch.arange(0, scores.shape[0]*scores.shape[1], dtype=torch.long, device=scores.device)
-            prediction_template = prediction_template.view(scores.shape[0], scores.shape[1])
-            max_score = torch.argmax(scores.view(scores.shape[0], scores.shape[1], -1), dim=2)  # batch, step
-        else:
-            scores = torch.diagonal(scores, dim1=1, dim2=3)  # data_batch, target_batch, step
-            prediction_template = torch.arange(0, scores.shape[0], dtype=torch.long, device=scores.device)
-            prediction_template = prediction_template[:, None].repeat(1, self.hparams.prediction_steps)
-            max_score = torch.argmax(scores, dim=1) # batch, step
-
-        correctly_predicted = torch.eq(prediction_template, max_score)
-        prediction_accuracy = torch.sum(correctly_predicted).float() / prediction_template.numel() # per prediction step  # self.validation_examples_per_batch
+        test_grid_out = self.forward(task_data, priors)
+        loss = F.cross_entropy(test_grid_out.view(-1, 11), target.view(-1))
 
         # in DP mode (default) make sure if result is scalar, there's another dim in the beginning
         if self.trainer.use_dp:
             loss = loss.unsqueeze(0)
-            prediction_accuracy = prediction_accuracy.unsqueeze(0)
 
         output = OrderedDict({
             'val_loss': loss,
-            'val_acc': torch.mean(prediction_accuracy)
+            'val_acc': 0.
         })
 
         return output
@@ -220,31 +198,11 @@ class ArcSystem(pl.LightningModule):
         val_loss_mean /= len(outputs)
         val_acc_mean /= len(outputs)
 
-        test_task_dict = {}
-        if self.get_test_task_model is not None:
-            test_task_model = self.get_test_task_model()
-            test_task_model.calculate_data()
-
-            # if not self.experiment.debug:
-            #     self.experiment.add_embedding(self.test_task_model.task_data,
-            #                                   metadata=self.test_task_model.task_labels,
-            #                                   global_step=self.global_step)
-
-            trainer = pl.Trainer(logger=False,
-                                 checkpoint_callback=False,
-                                 max_epochs=100)
-            trainer.fit(test_task_model)
-
-            test_task_dict['val_task_acc'] = trainer.callback_metrics['val_accuracy']
-            test_task_dict['val_task_loss'] = trainer.callback_metrics['val_loss']
-
         tqdm_dic = {'val_loss': val_loss_mean, 'val_acc': val_acc_mean}
         result = {
             "progress_bar": tqdm_dic,
             "log": {"val_loss": val_loss,
-                    "val_acc": val_acc_mean,
-                    "val_task_acc": trainer.callback_metrics['val_accuracy'],
-                    "val_task_loss": trainer.callback_metrics['val_loss']},
+                    "val_acc": val_acc_mean},
             "val_loss": val_loss_mean
         }
         return result

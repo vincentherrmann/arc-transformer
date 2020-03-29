@@ -35,11 +35,11 @@ def main(hparams, cluster=None, results_dict=None):
     # init experiment
 
     name = "arc_test_1"
-    logs_dir = "/Users/vincentherrmann/Documents/Projekte/abstraction-and-reasoning-challenge/logs"
-    checkpoint_dir = "/Users/vincentherrmann/Documents/Projekte/abstraction-and-reasoning-challenge/checkpoints/" + name
-    hparams.training_set_path = '/Users/vincentherrmann/Documents/Projekte/abstraction-and-reasoning-challenge/data/training'
-    hparams.validation_set_path = '/Users/vincentherrmann/Documents/Projekte/abstraction-and-reasoning-challenge/data/evaluation'
-    hparams.test_task_set_path = '/Users/vincentherrmann/Documents/Projekte/abstraction-and-reasoning-challenge/data/test'
+    logs_dir = "../../logs"
+    checkpoint_dir = "../../checkpoints/" + name
+    hparams.training_set_path = '../../data/training'
+    hparams.validation_set_path = '../../data/evaluation'
+    hparams.test_task_set_path = '../../data/test'
     hparams.data_path = hparams.training_set_path
 
     hparams.batch_size = 1
@@ -53,7 +53,7 @@ def main(hparams, cluster=None, results_dict=None):
     trainer = Trainer(gpus=0,
                       train_percent_check=1.,
                       val_percent_check=1.,
-                      val_check_interval=0.5,
+                      val_check_interval=1.,
                       logger=False,
                       checkpoint_callback=checkpoint_callback,
                       fast_dev_run=False,

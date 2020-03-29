@@ -51,10 +51,16 @@ class ArcTransformer(torch.nn.Module):
         self.feature_dim = feature_dim
         self.num_iterations = num_iterations
 
-        self.register_buffer("in_embedding", torch.rand(self.feature_dim) * math.sqrt(self.feature_dim))
-        self.register_buffer("out_embedding", torch.rand(self.feature_dim) * math.sqrt(self.feature_dim))
-        self.register_buffer("pair_embedding", torch.rand(10, self.feature_dim) * math.sqrt(self.feature_dim))
-        self.register_buffer("task_embedding", torch.rand(self.feature_dim) * math.sqrt(self.feature_dim))
+        s = 1 / math.sqrt(self.feature_dim)
+        self.register_buffer("in_embedding", torch.randn(self.feature_dim) * s)
+        self.register_buffer("out_embedding", torch.randn(self.feature_dim) * s)
+        self.register_buffer("train_embedding", torch.randn(self.feature_dim) * s)
+        self.register_buffer("test_embedding", torch.randn(self.feature_dim) * s)
+        self.register_buffer("pair_embedding", torch.randn(10, self.feature_dim) * s)
+        self.register_buffer("task_embedding", torch.randn(self.feature_dim) * s)
+        self.register_buffer("grid_positional_embedding", torch.randn(30, 30, self.feature_dim) * s)
+        self.register_buffer("pair_positional_embedding", torch.randn(self.num_pair_features, self.feature_dim) * s)
+        self.register_buffer("task_positional_embedding", torch.randn(self.num_task_features, self.feature_dim) * s)
 
         self.input_layer = torch.nn.Linear(in_features=11, out_features=feature_dim, bias=True)
 
@@ -108,19 +114,31 @@ class ArcTransformer(torch.nn.Module):
         grids_mask = (grids > 0).float().view(batch_size, num_pairs*2, w*h)  # batch x num_pairs*2 x w*h
         grids_target_mask = torch.einsum('nps,npt->npst', grids_mask, grids_mask).view(batch_size*num_pairs*2,
                                                                                        w*h, w*h)
-        grids_mask = F.pad(grids_mask.view(batch_size, num_pairs, 2*w*h), pad=(0, self.num_task_features), value=1.)
-        pair_external_mask = grids_mask.repeat(1, self.num_pair_features, 1).view(batch_size*num_pairs,
-                                                                                  self.num_pair_features,
-                                                                                  2*w*h + self.num_task_features)
+        ext_grids_mask = F.pad(grids_mask.view(batch_size, num_pairs, 2*w*h), pad=(0, self.num_task_features), value=1.)
+        pair_external_mask = ext_grids_mask.repeat(1, self.num_pair_features, 1).view(batch_size*num_pairs,
+                                                                                      self.num_pair_features,
+                                                                                      2*w*h + self.num_task_features)
+        grids_pos_embedding = self.grid_positional_embedding[:w, :h, :].reshape(1, w*h, self.feature_dim)
+
         grids = F.one_hot(grids, num_classes=11)
         grids = grids.view(batch_size*num_pairs*2, w*h, -1)
+        grids_mask = grids_mask.view(batch_size*num_pairs*2, w*h, 1)
 
         grid_prior = task_flatten(grid_prior)
 
         pair_features = torch.zeros(batch_size * num_pairs, self.num_pair_features, self.feature_dim)
+        pair_features += self.pair_positional_embedding[None]
+        pair_features[:num_train_pairs] += self.train_embedding[None, None]
+        pair_features[num_train_pairs:] += self.test_embedding[None, None]
+
         task_features = torch.zeros(batch_size, self.num_task_features, self.feature_dim)
+        task_features += self.task_positional_embedding[None]
 
         grids = self.input_layer(grids.float())
+        grids += grids_pos_embedding
+        grids[:(num_train_pairs*2)] += self.train_embedding[None, None]
+        grids[(num_train_pairs*2):] += self.test_embedding[None, None]
+        grids = (grids + grids_pos_embedding) * grids_mask
 
         # add grid positional embedding (10 features)
         # add pair and task feature positional embedding
@@ -130,6 +148,7 @@ class ArcTransformer(torch.nn.Module):
             target = grids
             external = pair_features[:, None, :, :].repeat(1, 2, 1, 1).view(grids.shape[0], self.num_pair_features, -1)
             grids = self.grid_layer(target, external, target_prior=grid_prior, target_mask=grids_target_mask)
+            grids = grids * grids_mask
 
             # pair layer
             target = pair_features
@@ -147,4 +166,4 @@ class ArcTransformer(torch.nn.Module):
                         self.pair_embedding[None, :num_pairs, None, :]).view(batch_size, -1, self.feature_dim)
             task_features = self.task_layer(target, external)
 
-
+        return grids, pair_features, task_features
