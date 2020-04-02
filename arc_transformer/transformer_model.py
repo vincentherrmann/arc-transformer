@@ -33,7 +33,7 @@ class TransformerLayer(torch.nn.Module):
         target = self.norm1(target)
 
         target2 = self.external_attention(target, external, external, attention_mask=external_mask,
-                                          attention_prior=external_prior, r_dims=external_dims)
+                                          relative_attention_features=external_prior, r_dims=external_dims)
 
         target = target + self.dropout2(target2)
         target = self.norm2(target)
@@ -70,9 +70,9 @@ class ArcTransformer(torch.nn.Module):
                                                       num_heads=num_heads,
                                                       relative_dim=relative_priors_dim,
                                                       dropout=dropout)
-        external_attention = MultiheadAttention(feature_dim=feature_dim,
-                                                num_heads=num_heads,
-                                                dropout=dropout)
+        external_attention = RelativeMultiheadAttention(feature_dim=feature_dim,
+                                                        num_heads=num_heads,
+                                                        dropout=dropout)
         self.grid_layer = TransformerLayer(feature_dim=feature_dim,
                                            feedforward_dim=feedforward_dim,
                                            self_attention_module=self_attention,
@@ -80,12 +80,12 @@ class ArcTransformer(torch.nn.Module):
                                            dropout=dropout)
 
         # pair layer
-        self_attention = MultiheadAttention(feature_dim=feature_dim,
-                                            num_heads=num_heads,
-                                            dropout=dropout)
-        external_attention = MultiheadAttention(feature_dim=feature_dim,
-                                                num_heads=num_heads,
-                                                dropout=dropout)
+        self_attention = RelativeMultiheadAttention(feature_dim=feature_dim,
+                                                    num_heads=num_heads,
+                                                    dropout=dropout)
+        external_attention = RelativeMultiheadAttention(feature_dim=feature_dim,
+                                                        num_heads=num_heads,
+                                                        dropout=dropout)
         self.pair_layer = TransformerLayer(feature_dim=feature_dim,
                                            feedforward_dim=feedforward_dim,
                                            self_attention_module=self_attention,
@@ -93,12 +93,12 @@ class ArcTransformer(torch.nn.Module):
                                            dropout=dropout)
 
         # task layer
-        self_attention = MultiheadAttention(feature_dim=feature_dim,
-                                            num_heads=num_heads,
-                                            dropout=dropout)
-        external_attention = MultiheadAttention(feature_dim=feature_dim,
-                                                num_heads=num_heads,
-                                                dropout=dropout)
+        self_attention = RelativeMultiheadAttention(feature_dim=feature_dim,
+                                                    num_heads=num_heads,
+                                                    dropout=dropout)
+        external_attention = RelativeMultiheadAttention(feature_dim=feature_dim,
+                                                        num_heads=num_heads,
+                                                        dropout=dropout)
         self.task_layer = TransformerLayer(feature_dim=feature_dim,
                                            feedforward_dim=feedforward_dim,
                                            self_attention_module=self_attention,
@@ -147,25 +147,25 @@ class ArcTransformer(torch.nn.Module):
         for i in range(self.num_iterations):
             # grid layer
             target = grids
-            external = pair_features[:, None, :, :].repeat(1, 2, 1, 1).view(grids.shape[0], self.num_pair_features, -1)
+            external = pair_features[:, :, None, :].repeat(1, 1, 2, 1).view(self.num_pair_features, grids.shape[1], self.feature_dim)
             grids = self.grid_layer(target, external,
                                     target_prior=grid_prior, target_mask=grids_target_mask, target_dims=(h, w))
             grids = grids * grids_mask
 
             # pair layer
             target = pair_features
-            reshaped_grids = grids.view(batch_size*num_pairs, 2, w*h, self.feature_dim)
-            reshaped_grids[:, 0] += self.in_embedding
-            reshaped_grids[:, 1] += self.out_embedding
-            reshaped_grids = reshaped_grids.view(batch_size*num_pairs, 2*w*h, self.feature_dim)
-            task_external = (task_features + self.task_embedding).repeat(num_pairs, 1, 1)  # num_pairs, num_task_features, feature_dim
-            external = torch.cat([reshaped_grids, task_external], dim=1)  # num_pairs x 2*w*h + num_task_features x feature_dim
+            reshaped_grids = grids.view(2, w*h, batch_size*num_pairs, self.feature_dim)
+            reshaped_grids[0] += self.in_embedding
+            reshaped_grids[1] += self.out_embedding
+            reshaped_grids = reshaped_grids.view(2*w*h, batch_size*num_pairs, self.feature_dim)
+            task_external = (task_features + self.task_embedding).repeat(1, num_pairs, 1)  # num_task_features x num_pairs x feature_dim
+            external = torch.cat([reshaped_grids, task_external], dim=0)  # 2*w*h + num_task_features x num_pairs x feature_dim
             pair_features = self.pair_layer(target, external, external_mask=pair_external_mask)
 
             # task layer
             target = task_features
-            external = (pair_features.view(batch_size, num_pairs, self.num_pair_features, -1) + \
-                        self.pair_embedding[None, :num_pairs, None, :]).view(batch_size, -1, self.feature_dim)
+            external = (pair_features.view(num_pairs, batch_size, self.num_pair_features, -1) + \
+                        self.pair_embedding[:num_pairs, None, None, :]).view(-1, batch_size, self.feature_dim)
             task_features = self.task_layer(target, external)
 
         return grids, pair_features, task_features

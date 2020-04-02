@@ -1,5 +1,6 @@
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning import Trainer
+import torch
 from pytorch_lightning.logging import TensorBoardLogger
 import os.path
 import sys
@@ -50,7 +51,7 @@ def main(hparams, cluster=None, results_dict=None):
     #logger = TensorBoardLogger(save_dir=logs_dir, name=name)
     checkpoint_callback = ModelCheckpoint(filepath=checkpoint_dir, save_top_k=1)
     # configure trainer
-    trainer = Trainer(gpus=0,
+    trainer = Trainer(gpus=1 if torch.is_cuda.available() else 0,
                       train_percent_check=1.,
                       val_percent_check=1.,
                       val_check_interval=1.,

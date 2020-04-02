@@ -61,7 +61,7 @@ class ArcSystem(pl.LightningModule):
         :return:
         """
         grids, pair_features, task_features = self.model(task_data, relative_priors)
-        test_out_grid = grids[-1]
+        test_out_grid = grids[:, -1]
         test_out_grid = self.out_transform(test_out_grid)
         return test_out_grid
 
@@ -108,7 +108,9 @@ class ArcSystem(pl.LightningModule):
         """
         task_data, priors = self.preprocessing(data)
         target = task_data["test"][-1]["output"].clone()
-        task_data["test"][-1]["output"] = torch.ones_like(target)
+        mask = (target.sum(dim=2) == 0.).long()
+        target = (mask * 10) + target.argmax(dim=2) * (1 - mask)
+        task_data["test"][-1]["output"] *= 0.
 
         test_grid_out = self.forward(task_data, priors)
         loss = F.cross_entropy(test_grid_out.view(-1, 11), target.view(-1))
@@ -150,7 +152,9 @@ class ArcSystem(pl.LightningModule):
 
         task_data, priors = self.preprocessing(data)
         target = task_data["test"][-1]["output"].clone()
-        task_data["test"][-1]["output"] = torch.ones_like(target)
+        mask = (target.sum(dim=2) == 0.).long()
+        target = (mask * 10) + target.argmax(dim=2) * (1-mask)
+        task_data["test"][-1]["output"] *= 0.
 
         test_grid_out = self.forward(task_data, priors)
         loss = F.cross_entropy(test_grid_out.view(-1, 11), target.view(-1))

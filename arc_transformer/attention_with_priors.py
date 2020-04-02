@@ -146,7 +146,6 @@ class RelativeMultiheadAttention(torch.nn.Module):
 
         t, n, e = query_source.shape
         s = key_source.shape[0]
-        r = relative_attention_features.shape[1]
         h = self.num_heads
         eh = e // self.num_heads
 
@@ -168,6 +167,7 @@ class RelativeMultiheadAttention(torch.nn.Module):
         logits = content_based_logits + content_bias  # n*h x t x s
 
         if self.relative_dim > 0:
+            r = relative_attention_features.shape[1]
             location_key = self.key_location_transform(relative_attention_features).view(r, n, h, eh)  # r x 1 x h x eh
             #location_key = location_key.repeat([1, n, 1, 1])  # r x n x h x eh
             location_key = location_key.permute(1, 2, 3, 0).view(n * h, eh, -1)  # n*h x eh x r
@@ -184,7 +184,7 @@ class RelativeMultiheadAttention(torch.nn.Module):
             logits = logits.view(n*h, t, s)
 
         weights = torch.softmax(logits, dim=2)  # n*h x t x s
-        self.weight_writer(weights.clone().detach().permute(1, 2, 0).view(t, s, n, h))
+        #self.weight_writer(weights.clone().detach().permute(1, 2, 0).view(t, s, n, h))
         weights = self.dropout(weights)
         weighted_value = torch.bmm(weights, value)  # n*h x t x eh
         weighted_value = weighted_value.view(n, h, t, eh).permute(2, 0, 1, 3).reshape(t, n, e)
@@ -230,16 +230,19 @@ class RelativeMultiheadAttention(torch.nn.Module):
     def _reset_parameters(self):
         torch.nn.init.xavier_uniform_(self.query_transform.weight)
         torch.nn.init.xavier_uniform_(self.key_content_transform.weight)
-        torch.nn.init.xavier_uniform_(self.key_location_transform.weight)
         torch.nn.init.xavier_uniform_(self.value_transform.weight)
         torch.nn.init.xavier_uniform_(self.output_projection.weight)
 
         if self.use_bias:
             torch.nn.init.constant_(self.query_transform.bias, 0.)
             torch.nn.init.constant_(self.key_content_transform.bias, 0.)
-            torch.nn.init.constant_(self.key_location_transform.bias, 0.)
             torch.nn.init.constant_(self.value_transform.bias, 0.)
             torch.nn.init.constant_(self.output_projection.bias, 0.)
+
+        if self.relative_dim > 0:
+            torch.nn.init.xavier_uniform_(self.key_location_transform.weight)
+            if self.use_bias:
+                torch.nn.init.constant_(self.key_location_transform.bias, 0.)
 
 
 class RelativeMultiheadAttention2d(RelativeMultiheadAttention):
@@ -283,12 +286,13 @@ class RelativeMultiheadAttention2d(RelativeMultiheadAttention):
         th = 2 * h - 1
         tw = 2 * w - 1
         skew = w - 1
-        mask_pattern = torch.full((th, tw), fill_value=float('-inf')).to(dev)
-        mask_pattern[-h:, -w:] = 0.
+        mask_pattern = torch.full((th, tw), fill_value=False, dtype=torch.bool).to(dev)
+        mask_pattern[-h:, -w:] = True
         mask_pattern = mask_pattern.view(1, -1).repeat(h, 1)
         mask_pattern = mask_pattern[:, -(r - skew):]
-        mask_pattern = F.pad(mask_pattern.reshape(-1), pad=(skew, (h - 1) * skew), value=float('-inf')).view(h, th, tw)
+        mask_pattern = F.pad(mask_pattern.reshape(-1), pad=(skew, (h - 1) * skew), value=False).view(h, th, tw)
         mask_pattern = mask_pattern.view(h, 1, th * tw).repeat(1, w, 1).view(1, h * w, th * tw)
 
-        masked_logits = skewed_logits + mask_pattern
-        return masked_logits
+        #masked_logits = skewed_logits + mask_pattern
+        selected_logits = skewed_logits[:, mask_pattern[0]].view(n, h*w, h*w)
+        return selected_logits
