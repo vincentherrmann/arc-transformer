@@ -1,5 +1,21 @@
 import torch
 import torch.nn.functional as F
+import math
+
+
+class PositionalEncoding(torch.nn.Module):
+    def __init__(self, features_dim, highest_freq=0.25):
+        super().__init__()
+        frequencies = torch.exp(torch.linspace(0., -10., features_dim // 4)) * highest_freq
+        self.register_buffer('frequencies', frequencies)
+        self.s = math.pi * 2
+
+    def forward(self, x):
+        # x:  th x tw x h x w x batch
+        w_cos_encoding = torch.cos(self.s * x[:, None] * self.frequencies[None, :])
+        w_sin_encoding = torch.sin(self.s * x[:, None] * self.frequencies[None, :])
+        encoding = torch.cat([cos_encoding, sin_encoding], dim=1)
+        return encoding
 
 
 class ArcPreprocessing(torch.nn.Module):
@@ -19,33 +35,45 @@ class ArcPreprocessing(torch.nn.Module):
 
 
 class PriorCalculation(torch.nn.Module):
-    def __init__(self, max_width=30, max_height=30, num_colors=10, max_num_objects=8):
+    def __init__(self, max_width=30, max_height=30, num_colors=10, max_num_objects=8, highes_freq=0.25,
+                 num_positional_features=64):
         super().__init__()
-        self.patterns = self.create_attention_patterns(size=(max_width*2 + 1, max_height*2 + 1))
-        self.patterns = self.patterns.view(-1, self.patterns.shape[2])
-        self.cw = max_width
-        self.ch = max_height
+        self.th = 2*max_height - 1
+        self.tw = 2*max_width - 1
+        self.ch = max_height - 1
+        self.cw = max_width - 1
+        self.patterns = self.create_attention_patterns(size=(self.th, self.tw))
+        #self.patterns = self.patterns.view(-1, self.patterns.shape[2])
         self.num_colors = num_colors
         self.max_num_objects = max_num_objects
         self.num_priors = self.patterns.shape[1] + 2 + self.max_num_objects * 8
+        self.highest_freq = highes_freq
+        self.num_positional_features = num_positional_features
+        self.positional_encoding = self.create_positional_encoding()
+        pass
+
+    def get_relative_priors(self, x):
+        if len(x.shape) == 4:
+            x = x[0]
+        h, w, _ = x.shape
+
+        relative_priors = self.positional_encoding[self.ch - h + 1:self.ch + h, self.cw - w + 1:self.cw + w]
+        return relative_priors
 
     def forward(self, x):
         if len(x.shape) == 3:
             x = x[0]
-        w, h = x.shape
+        h, w = x.shape
 
-        # patterns prior
-        positions = torch.stack([torch.arange(w)[:, None].repeat(1, h), torch.arange(h)[None, :].repeat(w, 1)], dim=2)
-        flat_positions = positions.view(-1, 2)
-        attention_positions = flat_positions[:, None, :] - flat_positions[None, :, :]  # s x s x 2
-        attention_positions[..., 0] += self.cw
-        attention_positions[..., 1] += self.ch
-        attention_positions = attention_positions[..., 0] * (2*self.ch + 1) + attention_positions[..., 1]  # s x s
-        patterns_prior = torch.index_select(self.patterns, 0, attention_positions.flatten()).view(w, h, w, h, -1)
+        #absolute_priors = self.positional_encoding[self.ch:self.ch + h, self.cw:self.cw + w]
 
-        # color prior
-        one_hot_x = F.one_hot(x, num_classes=self.num_colors).view(w*h, -1)  # s x c
-        color_prior = torch.index_select(one_hot_x.view(-1, self.num_colors), 1, x.flatten()).view(w, h, w, h, 1).float()
+        x = F.one_hot(x, num_classes=10).float()
+        #x = torch.cat([x, absolute_priors], dim=2)
+
+        return x
+
+        th = 2*h - 1
+        tw = 2*w - 1
 
         # object prior
         objects = self.extract_objects(x)
@@ -53,10 +81,10 @@ class PriorCalculation(torch.nn.Module):
         objects = objects[:self.max_num_objects]
         if len(objects) == 0:
             complete_objects_prior = torch.zeros_like(color_prior)
-            extracted_objects_prior = torch.zeros(w, h, w, h, self.max_num_objects * 8).to(complete_objects_prior.device)
+            extracted_objects_prior = torch.zeros(h, w, h, w, self.max_num_objects * 8).to(complete_objects_prior.device)
         else:
-            complete_objects = torch.stack([o[0] for o in objects], dim=2).view(w*h, -1)  # s x o
-            complete_objects_prior = torch.einsum('so,to->st', complete_objects, complete_objects).view(w, h, w, h, 1).float()
+            complete_objects = torch.stack([o[0] for o in objects], dim=2).view(h, w, -1)  # s x o
+            complete_objects_prior = torch.einsum('so,to->st', complete_objects, complete_objects).view(h, w, h, w, 1).float()
 
             extracted_objects = []
             max_size = 0
@@ -77,20 +105,37 @@ class PriorCalculation(torch.nn.Module):
                 c[:obj.shape[0], :obj.shape[1]] = obj
                 extracted_objects[i] = c
             extracted_objects = torch.stack(extracted_objects, dim=0)
-            c = torch.zeros(extracted_objects.shape[0], w, h).long()
-            c[:, :max_size, :max_size] = extracted_objects[:, :w, :h]
-            skew_c = torch.zeros(c.shape[0], w*h+1).long()
-            skew_c[:, :w*h] = c.view(-1, w*h)
-            skew_c = skew_c[:, None, :].repeat(1, w*h, 1).view(-1, w*h+1, w*h)
-            extracted_objects_prior = skew_c[:, :w*h, :].view(-1, w, h, w, h).permute(1, 2, 3, 4, 0).float()
+            c = torch.zeros(extracted_objects.shape[0], h, w).long()
+            c[:, :max_size, :max_size] = extracted_objects[:, :h, :w]
+            skew_c = torch.zeros(c.shape[0], h*w+1).long()
+            skew_c[:, :h*w] = c.view(-1, h*w)
+            skew_c = skew_c[:, None, :].repeat(1, h*w, 1).view(-1, h*w+1, h*w)
+            extracted_objects_prior = skew_c[:, :h*w, :].view(-1, h, w, h, w).permute(1, 2, 3, 4, 0).float()
             if extracted_objects_prior.shape[4] < self.max_num_objects * 8:
                 extracted_objects_prior = F.pad(extracted_objects_prior,
                                                 pad=(0, self.max_num_objects * 8 - extracted_objects_prior.shape[4]))
 
-        all_priors = torch.cat([patterns_prior, color_prior, complete_objects_prior, extracted_objects_prior], dim=4)
-        return all_priors.view(w*h, w*h, -1)
+        all_priors = torch.cat([complete_objects_prior, extracted_objects_prior], dim=4)
+        return all_priors.view(h*w, h*w, -1)
 
-    def create_attention_patterns(self, size=(9, 9)):
+    def create_positional_encoding(self):
+        freqs = torch.exp(torch.linspace(0., -3., self.num_positional_features // 4)) * self.highest_freq
+        s = math.pi * 2
+
+        pos = torch.arange(self.th) - self.ch
+        cos_encoding = torch.cos(s * pos[:, None] * freqs[None, :])
+        sin_encoding = torch.sin(s * pos[:, None] * freqs[None, :])
+        h_encoding = torch.cat([cos_encoding, sin_encoding], dim=1)[:, None, :].repeat(1, self.tw, 1)
+
+        pos = torch.arange(self.tw) - self.cw
+        cos_encoding = torch.cos(s * pos[:, None] * freqs[None, :])
+        sin_encoding = torch.sin(s * pos[:, None] * freqs[None, :])
+        w_encoding = torch.cat([cos_encoding, sin_encoding], dim=1)[None, :, :].repeat(self.th, 1, 1)
+        combined_encodings = torch.cat([h_encoding, w_encoding], dim=2)
+        return combined_encodings  # th x tw x e
+
+    @staticmethod
+    def create_attention_patterns(size=(9, 9)):
         c_w = (size[0] - 1) // 2
         c_h = (size[1] - 1) // 2
         indices = torch.arange(size[0])
@@ -98,11 +143,6 @@ class PriorCalculation(torch.nn.Module):
         dist = indices - c_w
         position = torch.stack([dist[:, None].repeat(1, size[1]),
                                 dist[None, :].repeat(size[1], 1)], dim=0)
-
-        one_hot_positions = F.one_hot(indices, num_classes=indices.shape[0]).float()
-        w_positions = one_hot_positions[None, :, :].repeat(size[0], 1, 1)
-        h_positions = one_hot_positions[:, None, :].repeat(1, size[0], 1)
-        positions = torch.cat([w_positions, h_positions], dim=2)
 
         patterns = []
         horizontal_line = torch.zeros(size)
@@ -156,7 +196,7 @@ class PriorCalculation(torch.nn.Module):
         patterns.append(torch.flip(quadrant, dims=[0, 1]))
 
         patterns = torch.stack(patterns, dim=2)
-        return torch.cat([positions, patterns], dim=2)
+        return patterns  #.view(size[0], size[1], -1)
 
     def find_object(self, grid, current_object, x, y):
         if x < 0 or x >= grid.shape[0] or y < 0 or y >= grid.shape[1]:
@@ -178,7 +218,7 @@ class PriorCalculation(torch.nn.Module):
         for x in range(grid.shape[0]):
             for y in range(grid.shape[1]):
                 v = grid[x, y]
-                if v == 0.:
+                if v == 0:
                     continue
                 current_object = empty_object.clone()
                 self.find_object(grid, current_object, x, y)

@@ -13,8 +13,9 @@ import pytorch_lightning as pl
 
 from arc_transformer.dataset import ArcDataset, task_map, task_reduce
 from arc_transformer.transformer_model import ArcTransformer
-from arc_transformer.preprocessing import PriorCalculation
+from arc_transformer.preprocessing import PriorCalculation, PositionalEncoding
 from arc_transformer.lr_schedulers import WarmupCosineSchedule
+
 
 class ArcSystem(pl.LightningModule):
     def __init__(self, hparams):
@@ -28,7 +29,9 @@ class ArcSystem(pl.LightningModule):
         self.batch_size = hparams.batch_size
         self.setup_datasets()
         self.prior_calc = PriorCalculation()
-        self.model = ArcTransformer(feature_dim=128, feedforward_dim=512, num_priors=self.prior_calc.num_priors)
+        self.positional_encoding = PositionalEncoding(features_dim=64)
+        self.model = ArcTransformer(input_dim=10, feature_dim=128, feedforward_dim=512,
+                                    relative_priors_dim=self.prior_calc.num_positional_features)
         self.out_transform = torch.nn.Linear(in_features=128, out_features=11)
 
     def setup_datasets(self):
@@ -38,31 +41,26 @@ class ArcSystem(pl.LightningModule):
         print("validation set length:", len(self.validation_set))
 
     def preprocessing(self, task_data):
-        task_data = task_map(task_data, lambda t: t[0])
-        priors = task_map(task_data, self.prior_calc)
-
-        #task_map(task_data, lambda t: print("grid shape", t.shape))
-        #task_map(priors, lambda t: print("prior shape", t.shape))
-
-        task_data = task_map(task_data, lambda t: t + 1)
+        task_data = task_map(task_data, lambda t: self.prior_calc(t))
+        relative_priors = task_map(task_data, lambda t: self.prior_calc.get_relative_priors(t))
         task_data, max_size = self.make_uniform_size(task_data)
-        priors, _ = self.make_uniform_size(priors, size=[max_size[0] * max_size[1], max_size[0] * max_size[1]])
+        relative_priors, _ = self.make_uniform_size(relative_priors)
 
         #task_map(task_data, lambda t: print("grid u shape", t.shape))
         #task_map(priors, lambda t: print("prior u shape", t.shape))
 
-        return task_data, priors
+        return task_data, relative_priors
 
     # ---------------------
     # TRAINING
     # ---------------------
-    def forward(self, task_data, priors):
+    def forward(self, task_data, relative_priors):
         """
         No special modification required for lightning, define as you normally would
         :param x:
         :return:
         """
-        grids, pair_features, task_features = self.model(task_data, priors)
+        grids, pair_features, task_features = self.model(task_data, relative_priors)
         test_out_grid = grids[-1]
         test_out_grid = self.out_transform(test_out_grid)
         return test_out_grid
@@ -74,8 +72,8 @@ class ArcSystem(pl.LightningModule):
                                f=lambda r, t: [max(r[0], t.shape[0]), max(r[1], t.shape[1])],
                                start_value=[0, 0])
         def pad_end(t):
-            padding = (0, size[1] - t.shape[1], 0, size[0] - t.shape[0])
-            if len(t.shape) == 3:
+            padding = (0, 0, 0, size[1] - t.shape[1], 0, size[0] - t.shape[0])
+            if len(t.shape) == 4:
                 padding = (0, 0) + padding
             r = F.pad(t, pad=padding)
             return r
