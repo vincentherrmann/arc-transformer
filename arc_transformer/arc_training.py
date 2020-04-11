@@ -43,6 +43,8 @@ def main(hparams, cluster=None, results_dict=None):
     hparams.test_task_set_path = '../../data/test'
     hparams.data_path = hparams.training_set_path
 
+    hparams.learning_rate = 0.001
+
     hparams.batch_size = 1
 
     # build model
@@ -51,14 +53,19 @@ def main(hparams, cluster=None, results_dict=None):
     #logger = TensorBoardLogger(save_dir=logs_dir, name=name)
     checkpoint_callback = ModelCheckpoint(filepath=checkpoint_dir, save_top_k=1)
     # configure trainer
+    torch.autograd.set_detect_anomaly(True)
     trainer = Trainer(gpus=1 if torch.cuda.is_available() else 0,
                       train_percent_check=1.,
                       val_percent_check=1.,
-                      val_check_interval=1.,
+                      #val_check_interval=1.,
                       logger=False,
                       checkpoint_callback=checkpoint_callback,
                       fast_dev_run=False,
-                      early_stop_callback=False)
+                      early_stop_callback=False,
+                      precision=32,
+                      accumulate_grad_batches=1,
+                      print_nan_grads=True,
+                      num_sanity_val_steps=0)
 
     # train model
     trainer.fit(model)

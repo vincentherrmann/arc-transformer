@@ -1,12 +1,12 @@
 from unittest import TestCase
-from arc_transformer.preprocessing import PriorCalculation
+from arc_transformer.preprocessing import Preprocessing
 
 import torch
 from matplotlib import pyplot as plt
 
 class TestCalculatePriors(TestCase):
     def test_prior_calculation(self):
-        p = PriorCalculation()
+        p = Preprocessing()
 
         test_input = torch.LongTensor([[0, 4, 4, 0, 0],
                                        [0, 0, 0, 0, 0],

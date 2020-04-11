@@ -34,10 +34,12 @@ class ArcPreprocessing(torch.nn.Module):
                 pos_h = torch.arange(h)[None, :].repeat(w, 1)
 
 
-class PriorCalculation(torch.nn.Module):
+class Preprocessing(torch.nn.Module):
     def __init__(self, max_width=30, max_height=30, num_colors=10, max_num_objects=8, highes_freq=0.25,
                  num_positional_features=64):
         super().__init__()
+        self.h = max_height
+        self.w = max_width
         self.th = 2*max_height - 1
         self.tw = 2*max_width - 1
         self.ch = max_height - 1
@@ -49,28 +51,31 @@ class PriorCalculation(torch.nn.Module):
         self.num_priors = self.patterns.shape[1] + 2 + self.max_num_objects * 8
         self.highest_freq = highes_freq
         self.num_positional_features = num_positional_features
-        self.positional_encoding = self.create_positional_encoding()
+        self.register_buffer("positional_encoding", self.create_positional_encoding())
         pass
 
     def get_relative_priors(self, x):
-        if len(x.shape) == 4:
-            x = x[0]
-        h, w, _ = x.shape
+        h = x.shape[-2]
+        w = x.shape[-1]
+        priors = self.positional_encoding[self.ch - h + 1:self.ch + h, self.cw - w + 1:self.cw + w]  # ph x pw x f
+        priors = priors.to(x.device)
 
-        relative_priors = self.positional_encoding[self.ch - h + 1:self.ch + h, self.cw - w + 1:self.cw + w]
-        return relative_priors
+        ph, pw, _ = priors.shape
+        padding = (0, 0, 0, self.tw - pw, 0, self.th - ph)
+        ppriors = F.pad(priors, pad=padding, value=0)
+
+        if len(x.shape) == 3:
+            ppriors = ppriors[None].repeat(x.shape[0], 1, 1, 1)
+        return ppriors
 
     def forward(self, x):
-        if len(x.shape) == 3:
-            x = x[0]
         h, w = x.shape
+        x += 1
 
-        #absolute_priors = self.positional_encoding[self.ch:self.ch + h, self.cw:self.cw + w]
-
-        x = F.one_hot(x, num_classes=10).float()
-        #x = torch.cat([x, absolute_priors], dim=2)
-
-        return x
+        padding = (0, self.w - w, 0, self.h - h)
+        px = F.pad(x, pad=padding, value=0)
+        px = F.one_hot(px, num_classes=11).float()
+        return px
 
         th = 2*h - 1
         tw = 2*w - 1

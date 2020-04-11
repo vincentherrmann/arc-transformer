@@ -137,7 +137,7 @@ class RelativeMultiheadAttention(torch.nn.Module):
         # query_source: target_seq x batch x emb_dimension
         # key_source: source_seq x batch x emb_dimension
         # value_source: source_seq x batch x emb_dimension (if None, then key_source will be used)
-        # attention_mask: t x s
+        # attention_mask: batch x target_seq x source_seq
         # relative_attention_features: relative_seq x batch x rel_dimension
         # r_dims: (h, w) for 2d attention
 
@@ -184,6 +184,10 @@ class RelativeMultiheadAttention(torch.nn.Module):
             logits = logits.view(n*h, t, s)
 
         weights = torch.softmax(logits, dim=2)  # n*h x t x s
+        #weights[torch.isnan(weights)] *= 0.
+        #w = torch.zeros_like(weights)
+        #w[~torch.isnan(weights)] = weights[~torch.isnan(weights)]
+        #weights = w
         #self.weight_writer(weights.clone().detach().permute(1, 2, 0).view(t, s, n, h))
         weights = self.dropout(weights)
         weighted_value = torch.bmm(weights, value)  # n*h x t x eh

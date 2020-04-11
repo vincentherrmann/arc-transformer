@@ -10,10 +10,11 @@ from torch import optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import pytorch_lightning as pl
+from matplotlib import pyplot as plt
 
 from arc_transformer.dataset import ArcDataset, task_map, task_reduce
 from arc_transformer.transformer_model import ArcTransformer
-from arc_transformer.preprocessing import PriorCalculation, PositionalEncoding
+from arc_transformer.preprocessing import Preprocessing, PositionalEncoding
 from arc_transformer.lr_schedulers import WarmupCosineSchedule
 
 
@@ -28,23 +29,29 @@ class ArcSystem(pl.LightningModule):
         self.hparams = hparams
         self.batch_size = hparams.batch_size
         self.setup_datasets()
-        self.prior_calc = PriorCalculation()
+        self.prior_calc = Preprocessing()
         self.positional_encoding = PositionalEncoding(features_dim=64)
-        self.model = ArcTransformer(input_dim=10, feature_dim=128, feedforward_dim=512,
-                                    relative_priors_dim=self.prior_calc.num_positional_features)
-        self.out_transform = torch.nn.Linear(in_features=128, out_features=11)
+        self.generator = ArcTransformer(input_dim=11, feature_dim=64, feedforward_dim=256, output_dim=11,
+                                        relative_priors_dim=self.prior_calc.num_positional_features,
+                                        num_iterations=3)
+        self.discriminator = ArcTransformer(input_dim=11, feature_dim=64, feedforward_dim=256, output_dim=1,
+                                            relative_priors_dim=self.prior_calc.num_positional_features,
+                                            num_iterations=2)
+        self.gumbel_temp = 5.
+        self.generated_grids = None
+        self.generated_priors = None
 
     def setup_datasets(self):
-        self.training_set = ArcDataset(self.hparams.training_set_path)
+        self.training_set = ArcDataset(self.hparams.training_set_path, max_size=(20, 20), augment=True)
         print("training set length:", len(self.training_set))
-        self.validation_set = ArcDataset(self.hparams.validation_set_path)
+        self.validation_set = ArcDataset(self.hparams.validation_set_path, max_size=(20, 20), augment=False)
         print("validation set length:", len(self.validation_set))
 
     def preprocessing(self, task_data):
         task_data = task_map(task_data, lambda t: self.prior_calc(t))
         relative_priors = task_map(task_data, lambda t: self.prior_calc.get_relative_priors(t))
-        task_data, max_size = self.make_uniform_size(task_data)
-        relative_priors, _ = self.make_uniform_size(relative_priors)
+        task_data, max_size = self.make_uniform_size(task_data, (20, 20))
+        relative_priors, _ = self.make_uniform_size(relative_priors, (39, 39))
 
         #task_map(task_data, lambda t: print("grid u shape", t.shape))
         #task_map(priors, lambda t: print("prior u shape", t.shape))
@@ -60,115 +67,201 @@ class ArcSystem(pl.LightningModule):
         :param x:
         :return:
         """
-        grids, pair_features, task_features = self.model(task_data, relative_priors)
+        grids, pair_features, task_features = self.generator(task_data, relative_priors)
         test_out_grid = grids[:, -1]
-        test_out_grid = self.out_transform(test_out_grid)
         return test_out_grid
 
-    @staticmethod
-    def make_uniform_size(data, size=None):
-        if size is None:
-            size = task_reduce(data,
-                               f=lambda r, t: [max(r[0], t.shape[0]), max(r[1], t.shape[1])],
-                               start_value=[0, 0])
-        def pad_end(t):
-            padding = (0, 0, 0, size[1] - t.shape[1], 0, size[0] - t.shape[0])
-            if len(t.shape) == 4:
-                padding = (0, 0) + padding
-            r = F.pad(t, pad=padding)
-            return r
-        data = task_map(data,
-                        f=pad_end)
-        return data, size
+    # @staticmethod
+    # def make_uniform_size(data, size=None):
+    #     if size is None:
+    #         size = task_reduce(data,
+    #                            f=lambda r, t: [max(r[0], t.shape[0]), max(r[1], t.shape[1])],
+    #                            start_value=[0, 0])
+    #     def pad_end(t):
+    #         padding = (0, 0, 0, size[1] - t.shape[1], 0, size[0] - t.shape[0])
+    #         if len(t.shape) == 4:
+    #             padding = (0, 0) + padding
+    #         r = F.pad(t, pad=padding)
+    #         return r
+    #     data = task_map(data,
+    #                     f=pad_end)
+    #     return data, size
 
-    def loss(self, scores):
-        batch_size = scores.shape[0]
+    # def on_after_backward(self):
+    #     parameters = self.named_parameters()
+    #     for name, p in parameters:
+    #         if p.grad is None:
+    #             print("no grad for", name)
+    #         elif (p.grad != p.grad).any():
+    #             print("nan in gradient of", name)
+    #         #else:
+    #         #    print("regular grad for", name)
+    #     pass
 
-        # scores: data_batch, data_step, target_batch, target_step
-        if self.hparams.score_over_all_timesteps:
-            n_scores = scores.view(-1, batch_size, self.prediction_steps)  # data_batch*data_step, target_batch. target_step
-            noise_scoring = torch.logsumexp(n_scores, dim=0)  # target_batch, target_step
-            valid_scores = torch.diagonal(scores, dim1=0, dim2=2)  # data_step, target_step, batch
-            valid_scores = torch.diagonal(valid_scores, dim1=0, dim2=1)  # batch, step
-        else:
-            scores = torch.diagonal(scores, dim1=1, dim2=3)  # data_batch, target_batch, step
-            noise_scoring = torch.logsumexp(scores, dim=0)  # target_batch, target_step
-            valid_scores = torch.diagonal(scores, dim1=0, dim2=1).permute([1, 0])  # batch, step
+    def adversarial_loss(self, grid_rating, y):
+        y_hat = grid_rating.mean(dim=1)
+        return F.binary_cross_entropy_with_logits(y_hat, y)
+        #return F.binary_cross_entropy(y_hat, y)
 
-        prediction_losses = -torch.mean(valid_scores - noise_scoring, dim=1)
-        loss = torch.mean(prediction_losses)
-
-        return loss
-
-    def training_step(self, data, batch_i):
+    def training_step(self, batch, batch_idx, optimizer_idx=0):
         """
         Lightning calls this inside the training loop
         :param data_batch:
         :return:
         """
-        task_data, priors = self.preprocessing(data)
-        target = task_data["test"][-1]["output"].clone()
-        mask = (target.sum(dim=2) == 0.).long()
-        target = (mask * 10) + target.argmax(dim=2) * (1 - mask)
-        task_data["test"][-1]["output"] *= 0.
+        data, priors = batch
+        batch_size = data.shape[0]
 
-        test_grid_out = self.forward(task_data, priors)
-        loss = F.cross_entropy(test_grid_out.view(-1, 11), target.view(-1))
+        # train generator
+        if optimizer_idx == 0:
+            target_solutions = data[:, -1].argmax(dim=3)
+            generator_data = data.clone()
+            generator_data[:, -1] = 1.
 
-        # in DP mode (default) make sure if result is scalar, there's another dim in the beginning
-        if self.trainer.use_dp:
-            loss = loss.unsqueeze(0)
+            #generator_priors = priors.clone()
+            test_out_priors = self.training_set.preprocessing.get_relative_priors(generator_data[:, -1, :, :, 0])
+            priors[:, -1] = test_out_priors
+            generator_priors = priors.clone()
 
-        print("loss:", loss.item())
+            generator_output = self.forward(generator_data, generator_priors)
 
-        output = OrderedDict({
-            'loss': loss,
-            'progress_bar': {'train_loss': loss},
-            'log': {'tng_loss': loss, 'lr': self.current_learning_rate}
-        })
+            # !!! only for testing TODO delete
+            #generator_output[:, 0] += 5.
 
-        return output
+            generated_grids = F.gumbel_softmax(generator_output, tau=self.gumbel_temp, hard=True)
+            generated_grids = generated_grids.view(batch_size, data.shape[2], data.shape[3], data.shape[4])
+            generated_solution = generated_grids.argmax(dim=3)
+
+            correct_cells = ((generated_solution - target_solutions[0]) == 0).sum().item()
+            accuracy = correct_cells / (generated_solution.shape[1] * generated_solution.shape[2])
+            print("accuracy:", accuracy * 100, "%")
+
+            num_valid_cells = (target_solutions != 0).sum().item()
+            correct_valid_cells = ((generated_solution[target_solutions != 0] - \
+                                    target_solutions[target_solutions != 0]) == 0).sum().item()
+            valid_accuracy = correct_valid_cells / num_valid_cells
+            print("valid accuracy:", valid_accuracy * 100, "%")
+
+            # remove rows and columns that have no valid values and calculate priors for the generated grids
+            # test_out_priors = []
+            # for valid_grid in generated_grids:
+            #     valid_rows = valid_grid[..., 0].prod(dim=1, keepdim=True) == 0.
+            #     valid_cols = valid_grid[..., 0].prod(dim=0, keepdim=True) == 0.
+            #     valid_grid = valid_grid[valid_rows * valid_cols].view(valid_rows.sum().item(),
+            #                                                           valid_cols.sum().item(),
+            #                                                           valid_grid.shape[2])
+            #     gp = self.training_set.preprocessing.get_relative_priors(valid_grid[..., 0])
+            #     test_out_priors.append(gp)
+            # test_out_priors = torch.stack(test_out_priors, dim=0)
+            #
+            # generator_data[:, -1] = generated_grids
+            # generator_priors = generator_priors.clone()
+            # generator_priors[:, -1] = test_out_priors
+            #
+            # self.generated_grids = generator_data
+            # self.generated_priors = generator_priors
+            #
+            # grid_rating, _, _ = self.discriminator(self.generated_grids, self.generated_priors)
+            # grid_rating = grid_rating[:, -1, 0].view(batch_size, -1)
+            # valid = torch.ones_like(grid_rating[:, 0])
+            # g_loss = self.adversarial_loss(grid_rating, valid)
+            #
+            # ce_loss = F.cross_entropy(generator_output, target_solutions.view(-1))
+            #ce_loss = F.cross_entropy(generated_grids.view(-1, 11), target_solutions.view(-1))
+            g_loss = ce_loss #+ g_loss
+
+            # print("generator loss:", g_loss.item())
+
+            tqdm_dict = {'g_loss': g_loss, 'accuracy': accuracy, 'valid_accuracy': valid_accuracy}
+            output = OrderedDict({
+                'loss': g_loss,
+                'progress_bar': tqdm_dict,
+                'log': tqdm_dict
+            })
+            return output
+
+        # train discriminator
+        if optimizer_idx == 1:
+            # Measure discriminator's ability to classify real from generated samples
+
+            # how well can it label as real?
+            grid_rating, _, _ = self.discriminator(data, priors)
+            grid_rating = grid_rating[:, -1, 0].view(batch_size, -1)
+            valid = torch.ones_like(grid_rating[:, 0])
+            real_loss = self.adversarial_loss(grid_rating, valid)
+
+            # how well can it label as fake?
+            grid_rating, _, _ = self.discriminator(self.generated_grids.detach(), self.generated_priors.detach())
+            grid_rating = grid_rating[:, -1, 0].view(batch_size, -1)
+            fake = torch.zeros_like(grid_rating[:, 0])
+            fake_loss = self.adversarial_loss(grid_rating, fake)
+
+            # discriminator loss is the average of these
+            d_loss = (real_loss + fake_loss) / 2
+            # print("discriminator loss:", d_loss.item())
+
+            tqdm_dict = {'d_loss': d_loss}
+            output = OrderedDict({
+                'loss': d_loss,
+                'progress_bar': tqdm_dict,
+                'log': tqdm_dict
+            })
+            return output
 
     def optimizer_step(self, current_epoch, batch_nb, optimizer, optimizer_i, second_order_closure=None):
-        lr_scale = self.lr_scheduler.lr_lambda(self.global_step)
-        for pg in optimizer.param_groups:
-            self.current_learning_rate = lr_scale * self.hparams.learning_rate
-            pg['lr'] = self.current_learning_rate
+        super().optimizer_step(current_epoch, batch_nb, optimizer, optimizer_i, second_order_closure)
+        current_step = self.trainer.global_step
+        if current_step % 50 == 0:
+            self.parameter_schedules(current_step)
 
-        # update params
-        optimizer.step()
-        optimizer.zero_grad()
+    def parameter_schedules(self, step):
+        self.gumbel_temp *= 0.9
+        print("gumbel temp:", self.gumbel_temp)
 
-    def validation_step(self, data, batch_i):
-        """
-        Lightning calls this inside the validation loop
-        :param data_batch:
-        :return:
-        """
+    # def optimizer_step(self, current_epoch, batch_nb, optimizer, optimizer_i, second_order_closure=None):
+    #     lr_scale = self.lr_scheduler.lr_lambda(self.global_step)
+    #     for pg in optimizer.param_groups:
+    #         self.current_learning_rate = lr_scale * self.hparams.learning_rate
+    #         pg['lr'] = self.current_learning_rate
+    #
+    #     # update params
+    #     optimizer.step()
+    #     optimizer.zero_grad()
 
-        # forward pass
-        # predicted_z: batch, step, features
-        # targets: batch, features, step
-
-        task_data, priors = self.preprocessing(data)
-        target = task_data["test"][-1]["output"].clone()
-        mask = (target.sum(dim=2) == 0.).long()
-        target = (mask * 10) + target.argmax(dim=2) * (1-mask)
-        task_data["test"][-1]["output"] *= 0.
-
-        test_grid_out = self.forward(task_data, priors)
-        loss = F.cross_entropy(test_grid_out.view(-1, 11), target.view(-1))
-
-        # in DP mode (default) make sure if result is scalar, there's another dim in the beginning
-        if self.trainer.use_dp:
-            loss = loss.unsqueeze(0)
-
-        output = OrderedDict({
-            'val_loss': loss,
-            'val_acc': 0.
-        })
-
-        return output
+    # def validation_step(self, data, batch_i):
+    #     """
+    #     Lightning calls this inside the validation loop
+    #     :param data_batch:
+    #     :return:
+    #     """
+    #
+    #     # forward pass
+    #     # predicted_z: batch, step, features
+    #     # targets: batch, features, step
+    #
+    #     task_data, priors = self.preprocessing(data)
+    #     target = task_data["test"][-1]["output"].clone()
+    #     mask = (target.sum(dim=2) == 0.).long()
+    #     target = (mask * 10) + target.argmax(dim=2) * (1-mask)
+    #     task_data["test"][-1]["output"] *= 0.
+    #     task_data["test"][-1]["output"][..., 0] = 1.
+    #
+    #     test_grid_out = self.forward(task_data, priors)
+    #
+    #     prediction = test_grid_out.argmax(dim=1).view(target.shape[0], target.shape[1])
+    #     acc = (target.flatten() == prediction.flatten()).sum().float() / target.numel()
+    #     loss = F.cross_entropy(test_grid_out.view(-1, 11), target.view(-1))
+    #
+    #     # in DP mode (default) make sure if result is scalar, there's another dim in the beginning
+    #     if self.trainer.use_dp:
+    #         loss = loss.unsqueeze(0)
+    #
+    #     output = OrderedDict({
+    #         'val_loss': loss,
+    #         'val_acc': acc
+    #     })
+    #
+    #     return output
 
     def validation_end(self, outputs):
         """
@@ -180,6 +273,7 @@ class ArcSystem(pl.LightningModule):
         # we return just the average in this case (if we want)
         # return torch.stack(outputs).mean()
 
+        val_loss = 0
         val_loss_mean = 0
         val_acc_mean = 0
         for output in outputs:
@@ -197,8 +291,11 @@ class ArcSystem(pl.LightningModule):
 
             val_acc_mean += val_acc
 
-        val_loss_mean /= len(outputs)
-        val_acc_mean /= len(outputs)
+        l = len(outputs)
+        l = l if l > 0 else 1
+
+        val_loss_mean /= l
+        val_acc_mean /= l
 
         tqdm_dic = {'val_loss': val_loss_mean, 'val_acc': val_acc_mean}
         result = {
@@ -217,12 +314,15 @@ class ArcSystem(pl.LightningModule):
         return whatever optimizers we want here
         :return: list of optimizers
         """
-        optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-        self.lr_scheduler = WarmupCosineSchedule(optimizer=optimizer,
-                                                 warmup_steps=self.hparams.warmup_steps,
-                                                 t_total=self.hparams.annealing_steps)
-        self.current_learning_rate = 0.
-        return optimizer
+        opt_g = torch.optim.Adam(self.generator.parameters(), lr=self.hparams.learning_rate)
+        opt_d = torch.optim.Adam(self.discriminator.parameters(), lr=self.hparams.learning_rate)
+
+        # self.lr_scheduler = WarmupCosineSchedule(optimizer=opt_g,
+        #                                          warmup_steps=self.hparams.warmup_steps,
+        #                                          t_total=self.hparams.annealing_steps)
+        # self.current_learning_rate = 0.
+        return [opt_g], []
+        #return [opt_g, opt_d], []
 
     #@pl.data_loader
     def train_dataloader(self):
@@ -235,13 +335,13 @@ class ArcSystem(pl.LightningModule):
             dataset=self.training_set,
             batch_size=self.batch_size,
             num_workers=0,
-            shuffle=True,
+            shuffle=False,
             pin_memory=True,
             drop_last=True
         )
         return loader
 
-    @pl.data_loader
+    #@pl.data_loader
     def val_dataloader(self):
         print('val data loader called')
         if torch.cuda.is_available():
@@ -252,13 +352,13 @@ class ArcSystem(pl.LightningModule):
             dataset=self.validation_set,
             batch_size=self.batch_size,
             num_workers=0,
-            shuffle=True,
+            shuffle=False,
             pin_memory=True,
             drop_last=True
         )
         return loader
 
-    @pl.data_loader
+    #@pl.data_loader
     def test_dataloader(self):
         print('test data loader called')
         return None
