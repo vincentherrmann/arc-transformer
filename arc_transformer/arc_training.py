@@ -35,7 +35,7 @@ def main(hparams, cluster=None, results_dict=None):
     """
     # init experiment
 
-    name = "arc_test_1"
+    name = "arc_adversarial_test_12_wasserstein_w_clipping_overfit"
     logs_dir = "../../logs"
     checkpoint_dir = "../../checkpoints/" + name
     hparams.training_set_path = '../../data/training'
@@ -43,29 +43,38 @@ def main(hparams, cluster=None, results_dict=None):
     hparams.test_task_set_path = '../../data/test'
     hparams.data_path = hparams.training_set_path
 
-    hparams.learning_rate = 0.001
+    hparams.num_heads = 4
+    hparams.max_grid_height = 12
+    hparams.max_grid_width = 12
+    hparams.augment = False
+    hparams.weight_clip_value = 0.1
+
+    hparams.learning_rate = 0.0001
 
     hparams.batch_size = 1
 
     # build model
     model = ArcSystem(hparams)
 
-    #logger = TensorBoardLogger(save_dir=logs_dir, name=name)
+    logger = TensorBoardLogger(save_dir=logs_dir, name=name)
+    logger = False
+
     checkpoint_callback = ModelCheckpoint(filepath=checkpoint_dir, save_top_k=1)
+    checkpoint_callback = False
     # configure trainer
-    torch.autograd.set_detect_anomaly(True)
+    #torch.autograd.set_detect_anomaly(True)
     trainer = Trainer(gpus=1 if torch.cuda.is_available() else 0,
-                      train_percent_check=1.,
-                      val_percent_check=1.,
+                      train_percent_check=0.02,
+                      val_percent_check=0.3,
                       #val_check_interval=1.,
-                      logger=False,
+                      logger=logger,
                       checkpoint_callback=checkpoint_callback,
                       fast_dev_run=False,
                       early_stop_callback=False,
                       precision=32,
                       accumulate_grad_batches=1,
                       print_nan_grads=True,
-                      num_sanity_val_steps=0)
+                      num_sanity_val_steps=3)
 
     # train model
     trainer.fit(model)

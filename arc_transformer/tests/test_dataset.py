@@ -19,6 +19,9 @@ class TestArcDataset(TestCase):
         dataset = ArcDataset("../../../data/training", max_size=(15, 15))
         print("length at with max size (15, 15):", len(dataset))
 
+        dataset = ArcDataset("../../../data/training", max_size=(12, 12))
+        print("length at with max size (12, 12):", len(dataset))
+
     def test_dataset_sizes(self):
         dataset = ArcDataset('../../../data/training')
         global h_hist, w_hist

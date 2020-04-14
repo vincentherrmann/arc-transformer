@@ -147,7 +147,6 @@ class ArcTransformer(torch.nn.Module):
         grids[-1:] += self.test_out_embedding[None, None]
         grids = (grids + grids_pos_embedding) * grids_mask
 
-
         pair_features = torch.zeros(self.num_pair_features, batch_size * num_pairs, self.feature_dim, device=grids.device)
         pair_features += self.pair_positional_embedding[:, None]
         pair_features[:num_train_pairs] += self.train_embedding[None, None]
